@@ -54,7 +54,11 @@ void send_message(int fd, string filePath, string headerFile){
         while(img_total_size > 0){
             int send_bytes = ((img_total_size < block_size) ? img_total_size : block_size);
             int done_bytes = sendfile(fd, fdimg, NULL, send_bytes);
+            img_total_size = img_total_size - done_bytes;
         }
+        if(sent_size >= 0){
+            printf("sent file: %s\n", filePath.c_str());
+        } close(fdimg);
     }
 }
 
@@ -122,6 +126,47 @@ void *connection_handler(void *socket_desc){
     } else if(request == 0){
         puts("Client disconnected unexpectedly");
     } else {
+
+        string mess = client_message;
+        int found = mess.find("multipart/form-data");
+        if(found != string::npos){
+            found = mess.find("Content-length:");
+            mess.erase(0, found + 16);
+            int length = stoi(getStr(mess, ' '));
+            found = mess.find("filename=");
+            mess.erase(0, found + 10);
+            string newf = getStr(mess, '"');
+            newf = "./public/downloads" + newf;
+            found = mess.find("Content-Type:");
+            mess.erase(0, found + 15);
+            mess.erase(0, getStr(mess, '\n').length() + 3);
+            
+            char client_mess[client_message_SIZE];
+            int fd, req, rcc, counter;
+            if((fd = open(newf.c_str(), O_CREAT | O_WRONLY, S_IRWXU)) < 0){
+                perror("cannot open filepath");
+            }
+            write(fd, mess.c_str(), client_message_SIZE);
+            printf("filesize: %d\n", length);
+            while(length > 0){
+                req = read(newSock, client_message, client_message_SIZE);
+                if((rcc = write(fd, client_mess, req)) < 0){
+                    perror("write failed");
+                    return(0);
+                }
+                length -= req;
+                counter += req;
+                printf("remains: %d. received size: %d. total size received: %d. \n", length, req, counter);
+                if(req < 1000){
+                    break;
+                }
+            }
+            if((rcc = close(fd)) < 0){
+                perror("close failed");
+                return 0;
+            }
+        }
+
         //printf("Client message: %s\n", client_message);
         string requestType = getStr(message, ' ');
         message.erase(0, requestType.length() + 1);

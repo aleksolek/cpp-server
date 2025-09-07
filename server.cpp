@@ -1,256 +1,290 @@
+#include "server.hpp"
 #include <arpa/inet.h>
-#include <netinet/in.h>
+#include <atomic>
+#include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
-#include <stdio.h>
-#include <unistd.h>
-#include <semaphore.h>
-#include <pthread.h>
-#include <vector>
-#include <sys/stat.h>
-#include <sys/sendfile.h>
 #include <fcntl.h>
-#include "server.h"
+#include <iostream>
+#include <mutex>
+#include <netinet/in.h>
+#include <queue>
+#include <sstream>
+#include <stdio.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
+#include <unordered_map>
+#include <vector>
 
-#define client_message_SIZE 1024
-#define PORT 8080
+constexpr int client_message_SIZE = 1024;
+constexpr int PORT = 8080;
 
-sem_t mutex;
-int thread_count = 0;
-std::vector<std::string> serverData;
+struct HttpRequest {
+  std::string method;
+  std::string path;
+  std::string version;
+  std::unordered_map<std::string, std::string> headers;
+  std::string body;
+};
 
-string getStr(string sql, char end){
-    int counter = 0;
-    string retStr = "";
-    while(sql[counter] != '\0'){
-        if(sql[counter] == end){
-            break;
-        }
-        retStr += sql[counter];
-        counter++;
-    }
-    return retStr;
+// Get rid of .. and double slashes // in the path
+std::string normalizePath(const std::string &path) {
+  std::vector<std::string> parts;
+  std::istringstream ss(path);
+  std::string token;
+  while (std::getline(ss, token, '/')) {
+    if (token == "" || token == ".")
+      continue;
+    if (token == ".." && !parts.empty())
+      parts.pop_back();
+    else if (token != "..")
+      parts.push_back(token);
+  }
+  std::string clean;
+  for (const auto &p : parts)
+    clean += "/" + p;
+  return clean.empty() ? "/" : clean;
 }
 
-void send_message(int fd, string filePath, string headerFile){
-    string header = Messages[HTTP_HEADER] + headerFile;
-    filePath = "/public" + filePath;
-    struct stat stat_buf;
+HttpRequest parseHttpRequest(const std::string &receivedMessage) {
+  HttpRequest parsedRequest;
+  // First line is: METHOD PATH VERSION
+  // For example GET /abc.html HTTP/1.1
+  std::istringstream requestStream(receivedMessage);
+  std::string line;
+  if (std::getline(requestStream, line)) {
+    std::istringstream firstLineStream(line);
+    firstLineStream >> parsedRequest.method >> parsedRequest.path >>
+        parsedRequest.version;
+  }
 
-    write(fd, header.c_str(), header.length());
-    int fdimg = open(filePath.c_str(), O_RDONLY);
+  // Normalize path to prevent directory traversal
+  parsedRequest.path = normalizePath(parsedRequest.path);
+  // Default to index.html if root requested
+  if (parsedRequest.path == "/") {
+    parsedRequest.path = "/index.html";
+  }
 
-    if(fdimg < 0){
-        printf("cannot open file path %s\n", filePath.c_str());
-        return;
+  while ((getline(requestStream, line)) && !line.empty() && (line != "\r")) {
+    auto colonPos = line.find(":");
+    if (colonPos != std::string::npos) {
+      std::string key = line.substr(0, colonPos);
+      std::string value = line.substr(colonPos + 1);
+
+      // Trim spaces
+      key.erase(key.find_last_not_of(" \t\r\n") + 1);
+      value.erase(0, value.find_first_not_of(" \t\r\n"));
+      parsedRequest.headers[key] = value;
     }
+  }
 
-    fstat(fdimg, &stat_buf);
-    int img_total_size = stat_buf.st_size;
-    int block_size = stat_buf.st_blksize;
-
-    if(fdimg >= 0){
-        size_t sent_size;
-        while(img_total_size > 0){
-            int send_bytes = ((img_total_size < block_size) ? img_total_size : block_size);
-            int done_bytes = sendfile(fd, fdimg, NULL, send_bytes);
-            img_total_size = img_total_size - done_bytes;
-        }
-        if(sent_size >= 0){
-            printf("sent file: %s\n", filePath.c_str());
-        } close(fdimg);
+  if (parsedRequest.method == "POST") {
+    auto it = parsedRequest.headers.find("Content-Length");
+    if (it != parsedRequest.headers.end()) {
+      size_t length = std::stoul(it->second);
+      parsedRequest.body.resize(length);
+      requestStream.read(&parsedRequest.body[0], length);
     }
+  }
+  return parsedRequest;
 }
 
-string findFileExt(string fileEx){
-    for(int i = 0; i <= sizeof(fileExtension); i++){
-        if(fileExtension[i] == fileEx){
-            return ContentType[i];
-        }
-    }
-    printf("serving .%s as html\n", fileEx.c_str());
-    return("Content-Type: text/html\r\n\r\n");
+std::queue<int> socketQueue;
+std::mutex queueMutex;
+std::mutex dataMutex;
+std::condition_variable queueCV;
+std::atomic<bool> serverRunning(true);
+
+void send_message(int fd, std::string filePath, std::string contentType) {
+  std::string basePath = "./public";
+  if (filePath.empty()) {
+    filePath = basePath + "/";
+  } else if (filePath.front() != '/') {
+    filePath = basePath + "/" + filePath;
+  } else {
+    filePath = basePath + filePath;
+  }
+  struct stat stat_buf;
+
+  int fdimg = open(filePath.c_str(), O_RDONLY);
+
+  if (fdimg < 0) {
+    perror(("Cannot open file: " + filePath).c_str());
+    write(fd, Messages[NOT_FOUND].c_str(), Messages[NOT_FOUND].length());
+    return;
+  }
+
+  fstat(fdimg, &stat_buf);
+  off_t fileSize = stat_buf.st_size;
+
+  // Build HTTP header
+  std::ostringstream header;
+  header << "HTTP/1.1 200 OK\r\n";
+  header << contentType;
+  header << "Content-Length: " << fileSize << "\r\n";
+  header << "Connection: close\r\n\r\n";
+
+  std::string headerStr = header.str();
+  write(fd, headerStr.c_str(), headerStr.size());
+
+  off_t offset = 0;
+  ssize_t sent_bytes;
+  while (offset < fileSize) {
+    sent_bytes = sendfile(fd, fdimg, &offset, fileSize - offset);
+    if (sent_bytes <= 0)
+      break;
+  }
+
+  close(fdimg);
 }
 
-void getData(string requestType, string client_message){
-    string extract;
-    string data = client_message;
-    
-    if(requestType == "GET"){
-        data.erase(0, getStr(data, ' ').length() + 1);
-        data = getStr(data, ' ');
-        data.erase(0, getStr(data, '?').length() + 1);
-    } else if(requestType == "POST"){
-        int counter = data.length() - 1;
-        while(counter > 0){
-            if(data[counter] == ' ' || data[counter] == '\n') {break;}
-            counter--;
-        }
-        data.erase(0, counter + 1);
-        int found = data.find("=");
-        if(found == string::npos){data = "";}
-    } 
-    int found = client_message.find("cookie");
-    if(found != string::npos){
-        client_message.erase(0, found + 8);
-        client_message = getStr(client_message, ' ');
-        data = data + "&" + getStr(client_message, '\n');
-    }
-
-    while(data.length() > 0){
-        extract = getStr(data, '&');
-        serverData.push_back(extract);
-        data.erase(0, getStr(data, '&').length() + 1);
-    }
+std::string getContentType(const std::string &fileExtension) {
+  auto it = mimeTypes.find(fileExtension);
+  if (it != mimeTypes.end()) {
+    return "Content-Type: " + it->second + "\r\n\r\n";
+  } else {
+    std::cout << "Unknown file extension: " << fileExtension
+              << ", defaulting to text/html\n";
+    return "Content-Type: text/html\r\n\r\n";
+  }
 }
 
-void *connection_handler(void *socket_desc){
-    int newSock = *((int *)socket_desc);
-    char client_message[client_message_SIZE];
-    int request = read(newSock, client_message, client_message_SIZE);
-    string message = client_message;
-    sem_wait(&mutex);
-    thread_count++;
-    printf("thread counter: %d\n", thread_count);
-    if(thread_count > 10){
-        write(newSock, Messages[BAD_REQUEST].c_str(), Messages[BAD_REQUEST].length());
-        thread_count--;
-        close(newSock);
-        sem_post(&mutex);
-        pthread_exit(NULL);
-    }
-    sem_post(&mutex);
+void connection_handler(int sock) {
+  std::vector<char> buffer(client_message_SIZE);
+  int bytesRead = read(sock, buffer.data(), buffer.size());
+  if (bytesRead <= 0) {
+    close(sock);
+    return;
+  }
+  std::string rawRequest(buffer.data(), bytesRead);
 
-    if(request < 0){
-        puts("Receive failed");
-    } else if(request == 0){
-        puts("Client disconnected unexpectedly");
+  // Parse HTTP request
+  HttpRequest request = parseHttpRequest(rawRequest);
+
+  // Extract file extension
+  std::string::size_type dotPos = request.path.find_last_of('.');
+  std::string fileExtension =
+      (dotPos != std::string::npos) ? request.path.substr(dotPos + 1) : "html";
+
+  if (request.method == "POST") {
+    if (!request.body.empty()) {
+      // For now just log it:
+      std::cout << request.body << std::endl;
+    }
+  }
+
+  // Build and send response
+  send_message(sock, request.path, getContentType(fileExtension));
+
+  std::cout << std::endl << "------ exiting connection -------" << std::endl;
+  close(sock);
+
+  return;
+}
+void workerThread() {
+  while (serverRunning) {
+    int clientSocket;
+
+    // Lock queue
+    {
+      std::unique_lock<std::mutex> lock(queueMutex);
+      queueCV.wait(lock, [] { return !socketQueue.empty() || !serverRunning; });
+
+      if (!serverRunning && socketQueue.empty())
+        break;
+
+      clientSocket = socketQueue.front();
+      socketQueue.pop();
+    }
+
+    // Handler connection
+    connection_handler(clientSocket);
+  }
+
+  // Clean up all remaining sockets
+  while (!socketQueue.empty()) {
+    int s = socketQueue.front();
+    socketQueue.pop();
+    close(s);
+  }
+}
+
+void signalHandler(int signum) {
+  std::cout << "\nInterrupt signal (" << signum
+            << ") received. Shutting down...\n";
+  serverRunning = false;
+  queueCV.notify_all();
+}
+
+int main(int argc, char const *argv[]) {
+  signal(SIGINT, signalHandler);
+  const int THREAD_POOL_SIZE = 4;
+  std::vector<std::thread> workers;
+  for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+    workers.emplace_back(workerThread);
+  }
+
+  /* Create TCP socket */
+  int server_socket;
+  int client_socket;
+
+  server_socket = socket(AF_INET, SOCK_STREAM, 0);
+
+  /* Check if socket was created */
+  if (server_socket < 0) {
+    perror("socket could not be created");
+    exit(EXIT_FAILURE);
+  }
+
+  /* Server listens on PORT from any IP address */
+  struct sockaddr_in server_address;
+  memset(&server_address, 0, sizeof(server_address));
+  server_address.sin_family = AF_INET;
+  server_address.sin_addr.s_addr = htonl(INADDR_ANY);
+  server_address.sin_port = htons(PORT);
+
+  /* Bind the socket */
+  if (bind(server_socket, (struct sockaddr *)&server_address,
+           sizeof(server_address)) < 0) {
+    perror("socket could not be bind");
+    exit(EXIT_FAILURE);
+  }
+  if (listen(server_socket, 10) < 0) {
+    perror("Error in listening");
+    exit(EXIT_FAILURE);
+  }
+
+  /* Listen for connection from client */
+  struct sockaddr_in client_address;
+  char ip4[INET_ADDRSTRLEN];
+  socklen_t len = sizeof(client_address);
+  std::cout << "Listening on port: " << PORT << std::endl;
+  while (serverRunning) {
+    client_socket =
+        accept(server_socket, (struct sockaddr *)&client_address, &len);
+    if (client_socket < 0) {
+      if (errno == EINTR)
+        continue; // interrupted by a signal. Check serverRunning
+      perror("Unable to accept connection");
+      break;
     } else {
-
-        string mess = client_message;
-        int found = mess.find("multipart/form-data");
-        if(found != string::npos){
-            found = mess.find("Content-length:");
-            mess.erase(0, found + 16);
-            int length = stoi(getStr(mess, ' '));
-            found = mess.find("filename=");
-            mess.erase(0, found + 10);
-            string newf = getStr(mess, '"');
-            newf = "./public/downloads" + newf;
-            found = mess.find("Content-Type:");
-            mess.erase(0, found + 15);
-            mess.erase(0, getStr(mess, '\n').length() + 3);
-            
-            char client_mess[client_message_SIZE];
-            int fd, req, rcc, counter;
-            if((fd = open(newf.c_str(), O_CREAT | O_WRONLY, S_IRWXU)) < 0){
-                perror("cannot open filepath");
-            }
-            write(fd, mess.c_str(), client_message_SIZE);
-            printf("filesize: %d\n", length);
-            while(length > 0){
-                req = read(newSock, client_message, client_message_SIZE);
-                if((rcc = write(fd, client_mess, req)) < 0){
-                    perror("write failed");
-                    return(0);
-                }
-                length -= req;
-                counter += req;
-                printf("remains: %d. received size: %d. total size received: %d. \n", length, req, counter);
-                if(req < 1000){
-                    break;
-                }
-            }
-            if((rcc = close(fd)) < 0){
-                perror("close failed");
-                return 0;
-            }
-        }
-
-        //printf("Client message: %s\n", client_message);
-        string requestType = getStr(message, ' ');
-        message.erase(0, requestType.length() + 1);
-        string requestFile = getStr(message, ' ');
-        
-        string requestF = requestFile;
-        string fileExt = requestF.erase(0, getStr(requestF, '.').length() + 1);
-        string fileEx = getStr(getStr(fileExt, '/'), '?');
-        requestFile = getStr(requestFile, '.') + '.' + fileEx;
-        
-        if(requestType == "GET" || requestType == "POST")
-        {
-            if(requestFile.length() <= 1){
-                requestFile = "/index.html";
-            }
-            if(fileEx == "php"){
-                getData(requestType, client_message);
-            }
-            sem_wait(&mutex);
-            send_message(newSock, requestFile, findFileExt(fileEx));
-            sem_post(&mutex);
-        } 
+      inet_ntop(AF_INET, &(client_address.sin_addr), ip4, INET_ADDRSTRLEN);
+      std::cout << "Client " << ip4 << " connected";
     }
-    printf("\n ------ exiting server -------\n ");
-    close(newSock);
-    sem_wait(&mutex);
-    thread_count--;
-    sem_post(&mutex);
-    pthread_exit(NULL);
-}
-
-int main(int argc, char const *argv[]){
-
-    sem_init(&mutex, 0, 1);
-    /* Create TCP socket */
-    int server_socket;
-    int client_socket;
-    
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    
-    /* Check if socket was created */
-    if(server_socket < 0){
-        perror("socket could not be created");
-        exit(EXIT_FAILURE);
+    {
+      std::lock_guard<std::mutex> lock(queueMutex);
+      socketQueue.push(client_socket);
+      queueCV.notify_one();
     }
- 
-    /* Server listens on PORT from any IP address */
-    struct sockaddr_in server_address;
-    memset(&server_address, 0, sizeof(server_address));
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_address.sin_port = htons(PORT);
+  }
 
-    /* Bind the socket */
-    if(bind(server_socket, (struct sockaddr *)&server_address, sizeof(server_address)) < 0){
-        perror("socket could not be bind");
-        exit(EXIT_FAILURE);
-    }
-    if(listen(server_socket, 10) < 0){
-        perror("Error in listening");
-        exit(EXIT_FAILURE);
-    }
-
-    /* Listen for connection from client */
-    struct sockaddr_in client_address;
-    char ip4[INET_ADDRSTRLEN];
-    socklen_t len = sizeof(client_address);
-    printf("Listening on port: %d\n", PORT);
-    while(1){
-        client_socket = accept(server_socket, (struct sockaddr *)&client_address, &len);
-        if(client_socket < 0){
-            perror("Unable to accept connection");
-            return 1;
-        } else {
-            inet_ntop(AF_INET, &(client_address.sin_addr), ip4, INET_ADDRSTRLEN);
-            printf("Client %s connected", ip4);
-        }
-        pthread_t multi_thread;
-        int *thread_sock = new int();
-        *thread_sock = client_socket;
-
-        if(pthread_create(&multi_thread, NULL, connection_handler, (void*)thread_sock) > 0){
-            perror("Could not create thread");
-            return 0;
-        }
-    }
+  for (auto &t : workers) {
+    if (t.joinable())
+      t.join();
+  }
+  close(server_socket);
+  std::cout << "Server closed cleanly" << std::endl;
 }
